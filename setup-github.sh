@@ -45,10 +45,14 @@ if [ -f certs/claudeos-mok.der ] && [ -f cosign.pub ]; then
   echo "Keys already made (certs/claudeos-mok.der, cosign.pub); keeping them."
   NEWKEYS=0
 else
-  openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 36500 \
+  # Fedora Atomic has no openssl command; borrow the one in the Flatpak runtime (network off)
+  OSSL() { flatpak run --unshare=network --command=openssl org.freedesktop.Platform//25.08 "$@"; }
+  OSSL genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /dev/stdout > "$TMP/mok.priv"
+  OSSL req -new -x509 -key /dev/stdin -sha256 -days 36500 \
     -subj "/CN=ClaudeOS NVIDIA module signing key/" \
     -addext "keyUsage=digitalSignature" -addext "extendedKeyUsage=codeSigning,1.3.6.1.4.1.2312.16.1.2" \
-    -keyout "$TMP/mok.priv" -outform DER -out certs/claudeos-mok.der 2>/dev/null
+    -outform DER -out /dev/stdout < "$TMP/mok.priv" > certs/claudeos-mok.der
+  test -s "$TMP/mok.priv" && test -s certs/claudeos-mok.der
   (cd "$TMP" && COSIGN_PASSWORD="" cosign generate-key-pair >/dev/null)
   cp "$TMP/cosign.pub" cosign.pub
   NEWKEYS=1
