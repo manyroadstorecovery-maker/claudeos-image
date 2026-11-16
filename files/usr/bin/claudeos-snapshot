@@ -13,7 +13,9 @@ delete them. They are read-only.
 
 Keep rules:
   home-auto-*  every snapshot from the last 24 h, then the newest per day for 14 days
-  *-pre-*      the newest 10 (system snapshots hold old OS files, so keep few)
+  home-pre-*   the newest 10
+  root-pre-*   the newest 2 (each pins a whole old OS image, several GB; rpm-ostree
+               already keeps a rollback OS, so more would just fill the small disk)
 """
 import datetime as dt
 import os
@@ -28,7 +30,7 @@ SOURCES = {"home": "home", "root": "root"}  # snapshot name -> subvolume
 NAME_RE = re.compile(r"^(home|root)-(auto|pre)-(\d{8}-\d{6})(?:-[A-Za-z0-9_.-]+)?$")
 KEEP_ALL_HOURS = 24
 KEEP_DAILY_DAYS = 14
-KEEP_PRE = 10
+KEEP_PRE = {"home": 10, "root": 2}
 
 
 def run(*cmd):
@@ -81,7 +83,7 @@ def to_delete(snaps, now):
     for src in SOURCES:
         pres = sorted((s for s in snaps if s[2] == "pre" and s[1] == src),
                       key=lambda s: s[3], reverse=True)
-        doomed += [s[0] for s in pres[KEEP_PRE:]]
+        doomed += [s[0] for s in pres[KEEP_PRE[src]:]]
     return doomed
 
 
