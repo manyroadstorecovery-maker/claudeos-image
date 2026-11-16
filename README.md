@@ -8,7 +8,7 @@ The system image for a ClaudeOS desktop: Fedora's official
   built for this image's exact kernel and signed for Secure Boot with the key in `certs/claudeos-mok.der`
 - the **ClaudeOS system pieces**, read-only in `/usr` (see `files/`): the Claude Code guard hook and its
   managed settings, `claudeos-apply`, hourly `/home` snapshots, the append-only audit-log rotation, the
-  network sentinel, stricter polkit rules, no LLMNR/mDNS/Avahi, weekly staged automatic updates, daily Flatpak
+  network sentinel, stricter polkit rules, no LLMNR/mDNS/Avahi, OS updates only on request (no automatic ones), daily Flatpak
   updates (which also keep Flatpak's NVIDIA driver copy matched to the kernel driver), and the labwc
   session + GT 1030 login-screen wrappers. Signature policy for this image ships in `/etc`.
 

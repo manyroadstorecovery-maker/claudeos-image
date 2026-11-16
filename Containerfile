@@ -62,12 +62,13 @@ RUN set -eux; \
 # ---------- ClaudeOS system settings (files/ holds the programs and configs; these are the rest) ----------
 RUN --mount=type=bind,source=build,target=/run/build \
     set -eux; \
-    # updates download in the background and apply at the next restart
+    # NO automatic OS updates: the 21 GB partition can't hold a new OS copy on a schedule.
+    # The user asks Claude for an update when they want one (rpm-ostree upgrade via claudeos-apply).
     if grep -q '^AutomaticUpdatePolicy=' /etc/rpm-ostreed.conf; then \
-      sed -i 's/^AutomaticUpdatePolicy=.*/AutomaticUpdatePolicy=stage/' /etc/rpm-ostreed.conf; \
-    else sed -i '/^\[Daemon\]/a AutomaticUpdatePolicy=stage' /etc/rpm-ostreed.conf; fi; \
-    grep -qx 'AutomaticUpdatePolicy=stage' /etc/rpm-ostreed.conf; \
-    systemctl enable rpm-ostreed-automatic.timer; \
+      sed -i 's/^AutomaticUpdatePolicy=.*/AutomaticUpdatePolicy=none/' /etc/rpm-ostreed.conf; \
+    else sed -i '/^\[Daemon\]/a AutomaticUpdatePolicy=none' /etc/rpm-ostreed.conf; fi; \
+    grep -qx 'AutomaticUpdatePolicy=none' /etc/rpm-ostreed.conf; \
+    systemctl disable rpm-ostreed-automatic.timer; \
     # don't announce this PC or answer name lookups on the local network
     systemctl mask avahi-daemon.socket avahi-daemon.service; \
     python3 -I /run/build/policy.py; \
