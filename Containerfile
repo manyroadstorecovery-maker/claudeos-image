@@ -14,13 +14,17 @@ RUN --mount=type=secret,id=akmods_key \
     dnf -y install \
       "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA}.noarch.rpm" \
       "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${FEDORA}.noarch.rpm"; \
-    dnf -y install "kernel-devel-${KVER}" akmod-nvidia-580xx; \
+    dnf -y install "kernel-devel-${KVER}" akmods; \
+    # its install script would try to build as root and fail; we build explicitly below instead
+    dnf -y install --setopt=tsflags=noscripts akmod-nvidia-580xx; \
     install -d -m 0755 /etc/pki/akmods/private; \
     install -o akmods -g akmods -m 0400 /run/secrets/akmods_key /etc/pki/akmods/private/private_key.priv; \
     chown akmods:akmods /etc/pki/akmods/certs/public_key.der; \
-    akmods --force --kernels "${KVER}" --kmod nvidia-580xx; \
+    install -d -o akmods -g akmods /tmp/akout /tmp/akhome; \
+    SRPM="$(ls /usr/src/akmods/nvidia-580xx-kmod*.src.rpm | grep -v latest | sort -V | tail -n1)"; \
+    runuser -u akmods -- env HOME=/tmp/akhome akmodsbuild -k "${KVER}" -o /tmp/akout "${SRPM}"; \
     rm -f /etc/pki/akmods/private/private_key.priv; \
-    mkdir -p /out && cp /var/cache/akmods/nvidia-580xx/kmod-nvidia-580xx-*.rpm /out/; \
+    mkdir -p /out && cp /tmp/akout/kmod-nvidia-580xx-*.rpm /out/; \
     # refuse to continue unless the module really is signed with our key
     mkdir /tmp/chk && cd /tmp/chk && rpm2cpio /out/kmod-nvidia-580xx-*.rpm | cpio -idm --quiet; \
     MOD="$(find /tmp/chk -name 'nvidia.ko*' | head -n1)"; \
