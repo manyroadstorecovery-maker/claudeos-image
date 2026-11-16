@@ -2,11 +2,13 @@
 # Daily app updates (ClaudeOS). First makes sure Flatpak apps have the NVIDIA driver copy that
 # matches the running kernel driver EXACTLY; a mismatch silently drops apps (Firefox, games)
 # to slow CPU drawing. Old copies are removed by "--unused" once nothing needs them.
+# Only the 64-bit copy (GL): the 32-bit one (GL32, ~470 MB) was for Windows games in Bottles,
+# which was removed 2026-11-16 to save disk. Add GL32 back here if Bottles comes back.
 set -euo pipefail
 if [ -r /sys/module/nvidia/version ]; then
   VER="$(cat /sys/module/nvidia/version)"
   if [[ "$VER" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
-    for ext in GL GL32; do
+    for ext in GL; do
       ref="org.freedesktop.Platform.$ext.nvidia-${VER//./-}"
       flatpak info --system "$ref" >/dev/null 2>&1 && continue
       echo "installing $ref (matches NVIDIA driver $VER)"
