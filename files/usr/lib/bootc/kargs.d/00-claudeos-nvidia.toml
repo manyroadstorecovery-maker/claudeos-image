@@ -1,0 +1,2 @@
+# Use NVIDIA's driver for the GT 1030, not nouveau; let it drive the screen directly (needed for Wayland)
+kargs = ["rd.driver.blacklist=nouveau", "modprobe.blacklist=nouveau", "nvidia-drm.modeset=1", "nvidia-drm.fbdev=1"]

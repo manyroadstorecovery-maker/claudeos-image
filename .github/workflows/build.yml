@@ -1,0 +1,62 @@
+# Builds the ClaudeOS image daily (and on every change), pushes it to GitHub's registry, signs it.
+name: build
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * *"   # daily, so Fedora's security updates arrive within a day
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make room (the image is large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Build
+        env:
+          AKMODS_KEY: ${{ secrets.AKMODS_PRIVATE_KEY }}
+        run: |
+          test -n "$AKMODS_KEY" || { echo "AKMODS_PRIVATE_KEY secret is missing"; exit 1; }
+          umask 077; printf '%s\n' "$AKMODS_KEY" > "$RUNNER_TEMP/akmods.key"
+          sudo buildah build --pull=always --layers=false \
+            --secret id=akmods_key,src="$RUNNER_TEMP/akmods.key" \
+            -t localhost/claudeos:latest .
+          shred -u "$RUNNER_TEMP/akmods.key"
+
+      - name: Push
+        id: push
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/claudeos-image"
+          echo "$TOKEN" | sudo buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
+          sudo buildah push --digestfile "$RUNNER_TEMP/digest" localhost/claudeos:latest "docker://$IMAGE:latest"
+          sudo buildah push localhost/claudeos:latest "docker://$IMAGE:$(date -u +%Y%m%d)"
+          echo "ref=$IMAGE@$(cat "$RUNNER_TEMP/digest")" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ""
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${{ steps.push.outputs.ref }}"
+          cosign verify --key cosign.pub "${{ steps.push.outputs.ref }}" > /dev/null && echo "signature verified"
