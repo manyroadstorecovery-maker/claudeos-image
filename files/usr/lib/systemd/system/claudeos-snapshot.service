@@ -3,6 +3,6 @@ Description=ClaudeOS: hourly read-only snapshot of /home
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/claudeos-snapshot auto
+ExecStart=/usr/bin/claudeos-snapshot auto
 Nice=19
 IOSchedulingClass=idle

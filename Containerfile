@@ -73,7 +73,11 @@ RUN --mount=type=bind,source=build,target=/run/build \
     python3 -I /run/build/policy.py; \
     # sanity checks: programs parse, units are valid, services are switched on
     # each program is checked in its own language (taken from its first line)
-    for f in /usr/sbin/claudeos-* /usr/bin/claudeos-* /usr/libexec/claudeos/* \
+    # Fedora's /usr/sbin, /bin, /sbin, /lib, /lib64 must stay links; copying a real folder over one hides
+    # the system's programs (an image once lost setfiles this way and every update failed at shutdown)
+    for l in /usr/sbin /bin /sbin /lib /lib64; do test -L "$l"; done; \
+    test -x /usr/sbin/setfiles; test -x /usr/sbin/init; \
+    for f in /usr/bin/claudeos-* /usr/libexec/claudeos/* \
              /usr/lib/claudeos/sentinel/claudeos_sentinel.py; do \
       case "$(head -n1 "$f")" in \
         *python3*) python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f" ;; \

@@ -3,4 +3,4 @@ Description=ClaudeOS: seal last month's audit log and start a new one
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/claudeos-audit-rotate
+ExecStart=/usr/bin/claudeos-audit-rotate
