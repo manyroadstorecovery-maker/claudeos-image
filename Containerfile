@@ -72,15 +72,18 @@ RUN --mount=type=bind,source=build,target=/run/build \
     systemctl mask avahi-daemon.socket avahi-daemon.service; \
     python3 -I /run/build/policy.py; \
     # sanity checks: programs parse, units are valid, services are switched on
-    python3 -I -c 'import ast,sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' \
-      /usr/libexec/claudeos/claudeos-guard /usr/lib/claudeos/sentinel/claudeos_sentinel.py \
-      /usr/bin/claudeos-sentinel-report; \
+    # each program is checked in its own language (taken from its first line)
+    for f in /usr/sbin/claudeos-* /usr/bin/claudeos-* /usr/libexec/claudeos/* \
+             /usr/lib/claudeos/sentinel/claudeos_sentinel.py; do \
+      case "$(head -n1 "$f")" in \
+        *python3*) python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f" ;; \
+        *bash*)    bash -n "$f" ;; \
+        *sh*)      sh -n "$f" ;; \
+        *)         echo "unknown program type: $f"; exit 1 ;; \
+      esac; \
+    done; \
     python3 -I -m json.tool /etc/claude-code/managed-settings.json >/dev/null; \
     python3 -I -m json.tool /etc/containers/policy.json >/dev/null; \
-    for f in /usr/sbin/claudeos-apply /usr/sbin/claudeos-audit-rotate /usr/sbin/claudeos-snapshot \
-             /usr/libexec/claudeos/flatpak-update; do bash -n "$f"; done; \
-    for f in /usr/libexec/claudeos/nvidia-card /usr/libexec/claudeos/greeter-compositor \
-             /usr/libexec/claudeos/labwc-session; do sh -n "$f"; done; \
     systemd-analyze verify --man=no /usr/lib/systemd/system/claudeos-*.service /usr/lib/systemd/system/claudeos-*.timer; \
     for u in multi-user.target.wants/claudeos-sentinel.service timers.target.wants/claudeos-snapshot.timer \
              timers.target.wants/claudeos-audit-rotate.timer timers.target.wants/claudeos-flatpak-update.timer; do \
