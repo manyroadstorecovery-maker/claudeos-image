@@ -21,6 +21,11 @@ RUN --mount=type=secret,id=akmods_key \
     install -o akmods -g akmods -m 0400 /run/secrets/akmods_key /etc/pki/akmods/private/private_key.priv; \
     chown akmods:akmods /etc/pki/akmods/certs/public_key.der; \
     install -d -o akmods -g akmods /tmp/akout /tmp/akhome; \
+    # The GT 1030 (Pascal) needs the proprietary module; the "open" one only supports Turing and newer.
+    # The spec guesses the variant from the GPU in the build machine, and CI has none, so it picks "open".
+    # Turning the guess off keeps the proprietary tree.
+    printf '%%_without_kmod_nvidia_detect 1\n' > /tmp/akhome/.rpmmacros; \
+    chown akmods:akmods /tmp/akhome/.rpmmacros; \
     SRPM="$(ls /usr/src/akmods/nvidia-580xx-kmod*.src.rpm | grep -v latest | sort -V | tail -n1)"; \
     runuser -u akmods -- env HOME=/tmp/akhome akmodsbuild -k "${KVER}" -o /tmp/akout "${SRPM}"; \
     rm -f /etc/pki/akmods/private/private_key.priv; \
@@ -29,7 +34,10 @@ RUN --mount=type=secret,id=akmods_key \
     mkdir /tmp/chk && cd /tmp/chk && rpm2cpio /out/kmod-nvidia-580xx-*.rpm | cpio -idm --quiet; \
     MOD="$(find /tmp/chk -name 'nvidia.ko*' | head -n1)"; \
     modinfo -F signer "${MOD}" | tee /out/signer.txt; \
-    test -s /out/signer.txt
+    test -s /out/signer.txt; \
+    # ...and unless it is the proprietary variant (the open one reports "Dual MIT/GPL")
+    modinfo -F license "${MOD}" | tee /out/license.txt; \
+    grep -qx NVIDIA /out/license.txt
 
 # ---------- stage 2: the image you boot ----------
 FROM ${BASE}
