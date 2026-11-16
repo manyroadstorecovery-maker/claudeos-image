@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Summary of what the network sentinel saw.   claudeos-sentinel-report [hours]   (default 24)
+
+Reads only the sentinel service's own journal lines (they can't be faked by other programs)."""
+import json
+import subprocess
+import sys
+import time
+from collections import Counter
+from datetime import datetime
+
+UNIT = "claudeos-sentinel.service"
+
+
+def lines(hours):
+    r = subprocess.run(["journalctl", "-o", "json", "--since", f"-{hours}h", f"_SYSTEMD_UNIT={UNIT}"],
+                       capture_output=True, text=True)
+    for raw in r.stdout.splitlines():
+        try:
+            e = json.loads(raw)
+            msg = e.get("MESSAGE")
+            if e.get("_SYSTEMD_UNIT") == UNIT and isinstance(msg, str) and " " in msg:
+                kind, body = msg.split(" ", 1)
+                yield int(e["__REALTIME_TIMESTAMP"]) // 1_000_000, kind, json.loads(body)
+        except (ValueError, KeyError):
+            continue
+
+
+def when(ts):
+    return datetime.fromtimestamp(ts).strftime("%a %H:%M")
+
+
+def main():
+    hours = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 24
+    alerts, dns, conns, new_devs, snapshot, info = [], Counter(), Counter(), [], None, []
+    for ts, kind, d in lines(hours):
+        if kind == "ALERT":
+            alerts.append((ts, d))
+        elif kind == "DNS":
+            dns[d.get("name", "?")] += 1
+        elif kind == "CONN":
+            conns[d.get("program", "?")] += 1
+        elif kind == "DEVICE" and d.get("event") == "new":
+            new_devs.append((ts, d))
+        elif kind == "SNAPSHOT":
+            snapshot = (ts, d)
+        elif kind == "INFO":
+            info.append((ts, d))
+
+    print(f"== ClaudeOS sentinel: last {hours} h")
+    running = subprocess.run(["systemctl", "is-active", UNIT], capture_output=True, text=True).stdout.strip()
+    print(f"Sentinel service: {running}")
+    learning = [d for _, d in info if "learning_until" in d]
+    if learning and learning[-1]["learning_until"] > time.time():
+        print(f"Still learning what's normal until {when(learning[-1]['learning_until'])} (no 'new thing' alerts yet)")
+
+    print(f"\n-- Alerts ({len(alerts)})")
+    for ts, a in alerts[-40:]:
+        det = ", ".join(f"{k}={v}" for k, v in a.get("details", {}).items() if v not in ("", None, [], False))
+        print(f"{when(ts)}  [{a.get('severity')}] {a.get('title')}\n             {det[:200]}")
+    if not alerts:
+        print("none")
+
+    print(f"\n-- New devices on the network ({len(new_devs)})")
+    for ts, d in new_devs[-30:]:
+        print(f"{when(ts)}  {d.get('mac')}  {d.get('ip') or ''}  {d.get('vendor')}  {d.get('name') or ''}")
+    if snapshot:
+        devs = snapshot[1].get("devices", {})
+        print(f"(known devices at {when(snapshot[0])}: {len(devs)})")
+        for mac, d in list(devs.items())[:30]:
+            print(f"   {mac}  {','.join(d.get('ips', []))}  {d.get('vendor')}  {d.get('name') or ''}")
+
+    print(f"\n-- Programs that went online ({len(conns)})")
+    for prog, n in conns.most_common(15):
+        print(f"{n:6}  {prog}")
+    print(f"\n-- Most looked-up websites ({len(dns)} names)")
+    for name, n in dns.most_common(20):
+        print(f"{n:6}  {name}")
+
+
+if __name__ == "__main__":
+    main()

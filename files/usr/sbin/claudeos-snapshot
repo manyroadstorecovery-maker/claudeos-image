@@ -1,0 +1,124 @@
+#!/usr/bin/python3 -I
+"""claudeos-snapshot — read-only btrfs snapshots of ClaudeOS data.
+
+Usage (as root):
+  claudeos-snapshot auto             hourly snapshot of /home, then prune old ones
+  claudeos-snapshot pre <label>      snapshot of /home AND the system (root) before a change
+  claudeos-snapshot list             show all snapshots
+  claudeos-snapshot prune --dry-run  show what pruning would delete
+
+Snapshots live at the top level of the encrypted btrfs volume in /snapshots,
+outside the normal file tree, so a normal user (or a hijacked agent) can't
+delete them. They are read-only.
+
+Keep rules:
+  home-auto-*  every snapshot from the last 24 h, then the newest per day for 14 days
+  *-pre-*      the newest 10 (system snapshots hold old OS files, so keep few)
+"""
+import datetime as dt
+import os
+import re
+import subprocess
+import sys
+
+DEVICE = "/dev/disk/by-uuid/d9019879-c63b-4994-8d2f-a38784b3879b"  # btrfs inside LUKS
+TOP = "/run/claudeos-btrfs-top"      # where the whole volume is mounted temporarily
+SNAPDIR = "snapshots"                # folder at the top of the volume
+SOURCES = {"home": "home", "root": "root"}  # snapshot name -> subvolume
+NAME_RE = re.compile(r"^(home|root)-(auto|pre)-(\d{8}-\d{6})(?:-[A-Za-z0-9_.-]+)?$")
+KEEP_ALL_HOURS = 24
+KEEP_DAILY_DAYS = 14
+KEEP_PRE = 10
+
+
+def run(*cmd):
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+
+
+def mount_top():
+    os.makedirs(TOP, mode=0o700, exist_ok=True)
+    if not os.path.ismount(TOP):
+        run("mount", "-o", "subvolid=5,noexec,nosuid,nodev", DEVICE, TOP)
+    os.makedirs(os.path.join(TOP, SNAPDIR), mode=0o700, exist_ok=True)
+
+
+def umount_top():
+    if os.path.ismount(TOP):
+        run("umount", TOP)
+
+
+def snapshots():
+    out = []
+    for name in sorted(os.listdir(os.path.join(TOP, SNAPDIR))):
+        m = NAME_RE.match(name)
+        if m:
+            when = dt.datetime.strptime(m.group(3), "%Y%m%d-%H%M%S")
+            out.append((name, m.group(1), m.group(2), when))
+    return out
+
+
+def take(source, kind, label=""):
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = f"{source}-{kind}-{stamp}" + (f"-{label}" if label else "")
+    dest = os.path.join(TOP, SNAPDIR, name)
+    run("btrfs", "subvolume", "snapshot", "-r", os.path.join(TOP, SOURCES[source]), dest)
+    print(f"snapshot made: {name}")
+
+
+def to_delete(snaps, now):
+    doomed = []
+    autos = sorted((s for s in snaps if s[2] == "auto"), key=lambda s: s[3], reverse=True)
+    days_kept = set()
+    for name, _src, _kind, when in autos:
+        age = now - when
+        if age <= dt.timedelta(hours=KEEP_ALL_HOURS):
+            continue
+        day = when.date()
+        if age <= dt.timedelta(days=KEEP_DAILY_DAYS) and day not in days_kept:
+            days_kept.add(day)
+            continue
+        doomed.append(name)
+    for src in SOURCES:
+        pres = sorted((s for s in snaps if s[2] == "pre" and s[1] == src),
+                      key=lambda s: s[3], reverse=True)
+        doomed += [s[0] for s in pres[KEEP_PRE:]]
+    return doomed
+
+
+def prune(dry_run=False):
+    for name in to_delete(snapshots(), dt.datetime.now()):
+        if dry_run:
+            print(f"would delete: {name}")
+        else:
+            run("btrfs", "subvolume", "delete", os.path.join(TOP, SNAPDIR, name))
+            print(f"deleted: {name}")
+
+
+def main(argv):
+    if os.geteuid() != 0:
+        sys.exit("claudeos-snapshot must run as root (try: sudo claudeos-snapshot ...)")
+    if not argv or argv[0] not in ("auto", "pre", "list", "prune"):
+        sys.exit(__doc__)
+    mount_top()
+    try:
+        if argv[0] == "auto":
+            take("home", "auto")
+            prune()
+        elif argv[0] == "pre":
+            label = argv[1] if len(argv) > 1 else ""
+            if label and not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", label):
+                sys.exit("label: letters, digits, _ . - only (max 40)")
+            take("home", "pre", label)
+            take("root", "pre", label)
+            prune()
+        elif argv[0] == "list":
+            for name, *_ in snapshots():
+                print(name)
+        elif argv[0] == "prune":
+            prune(dry_run="--dry-run" in argv)
+    finally:
+        umount_top()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

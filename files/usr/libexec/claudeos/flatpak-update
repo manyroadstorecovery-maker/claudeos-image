@@ -1,0 +1,18 @@
+#!/usr/bin/bash
+# Daily app updates (ClaudeOS). First makes sure Flatpak apps have the NVIDIA driver copy that
+# matches the running kernel driver EXACTLY; a mismatch silently drops apps (Firefox, games)
+# to slow CPU drawing. Old copies are removed by "--unused" once nothing needs them.
+set -euo pipefail
+if [ -r /sys/module/nvidia/version ]; then
+  VER="$(cat /sys/module/nvidia/version)"
+  if [[ "$VER" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+    for ext in GL GL32; do
+      ref="org.freedesktop.Platform.$ext.nvidia-${VER//./-}"
+      flatpak info --system "$ref" >/dev/null 2>&1 && continue
+      echo "installing $ref (matches NVIDIA driver $VER)"
+      flatpak install --system --noninteractive --assumeyes flathub "$ref" || echo "WARNING: could not install $ref"
+    done
+  fi
+fi
+flatpak update --system --noninteractive --assumeyes
+flatpak uninstall --system --unused --noninteractive --assumeyes

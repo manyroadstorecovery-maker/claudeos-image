@@ -1,0 +1,3 @@
+docker:
+  ghcr.io/manyroadstorecovery-maker/claudeos-image:
+    use-sigstore-attachments: true

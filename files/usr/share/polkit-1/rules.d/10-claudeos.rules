@@ -1,0 +1,56 @@
+// ClaudeOS: system-changing actions need the admin password EVERY time
+// (no 5-minute "keep"), even for users in the wheel group.
+// Why: Claude runs as the normal user. Without this rule, Fedora lets that user
+// layer packages, roll back or clean up the OS, add app sources, change network
+// and DNS settings and update firmware without any password.
+polkit.addRule(function(action, subject) {
+    var id = action.id;
+
+    // Leave these alone: everyday and read-only actions, containers (podman/toolbox).
+    var keep = [
+        "org.projectatomic.rpmostree1.upgrade",        // staged auto-updates
+        "org.projectatomic.rpmostree1.repo-refresh",
+        "org.projectatomic.rpmostree1.client-management",
+        "org.projectatomic.rpmostree1.cancel",
+        "org.projectatomic.rpmostree1.reload-daemon",
+        "org.fedoraproject.FirewallD1.info",
+        "org.freedesktop.fwupd.get-remotes",
+        "org.freedesktop.fwupd.refresh-remote",
+        "org.freedesktop.fwupd.clear-results",
+        "org.freedesktop.fwupd.verify",
+        "org.freedesktop.Flatpak.app-install",
+        "org.freedesktop.Flatpak.runtime-install",
+        "org.freedesktop.Flatpak.app-uninstall",
+        "org.freedesktop.Flatpak.runtime-uninstall",
+        "org.freedesktop.Flatpak.app-update",
+        "org.freedesktop.Flatpak.runtime-update",
+        "org.freedesktop.Flatpak.appstream-update",
+        "org.freedesktop.Flatpak.metadata-update",
+        "org.freedesktop.Flatpak.update-remote"
+    ];
+    if (keep.indexOf(id) >= 0) {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    var strict = [
+        /^org\.projectatomic\.rpmostree1\./,
+        /^org\.fedoraproject\.FirewallD1\./,
+        /^org\.freedesktop\.Flatpak\./,
+        /^org\.freedesktop\.fwupd\./,
+        /^org\.freedesktop\.systemd1\.(manage-units|manage-unit-files|reload-daemon|set-environment)$/,
+        /^org\.freedesktop\.NetworkManager\.(settings\.modify\.(system|global-dns|hostname)|reload|checkpoint-rollback)$/,
+        /^org\.freedesktop\.(resolve1|network1)\.(set-|revert)/,
+        /^org\.freedesktop\.timedate1\.set-/,
+        /^org\.freedesktop\.timesync1\./,
+        /^org\.freedesktop\.hostname1\.set-/,
+        /^org\.freedesktop\.(machine1|import1|portable1|home1|sysupdate1|realmd|accounts)\./,
+        /^io\.systemd\.(sysext|confext)\.manage$/,
+        /^io\.systemd\.(cryptenroll|sysinstall|credentials)\./
+    ];
+    for (var i = 0; i < strict.length; i++) {
+        if (strict[i].test(id)) {
+            return polkit.Result.AUTH_ADMIN;
+        }
+    }
+    return polkit.Result.NOT_HANDLED;
+});

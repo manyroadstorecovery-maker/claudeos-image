@@ -1,0 +1,10 @@
+[Unit]
+Description=ClaudeOS: take a /home snapshot every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

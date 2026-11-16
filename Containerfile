@@ -58,4 +58,32 @@ RUN set -eux; \
     systemctl enable nvidia-suspend.service nvidia-hibernate.service nvidia-resume.service; \
     rm -rf /tmp/nvidia /var/cache/* /var/lib/dnf /var/log/*; \
     dnf clean all
+
+# ---------- ClaudeOS system settings (files/ holds the programs and configs; these are the rest) ----------
+RUN --mount=type=bind,source=build,target=/run/build \
+    set -eux; \
+    # updates download in the background and apply at the next restart
+    if grep -q '^AutomaticUpdatePolicy=' /etc/rpm-ostreed.conf; then \
+      sed -i 's/^AutomaticUpdatePolicy=.*/AutomaticUpdatePolicy=stage/' /etc/rpm-ostreed.conf; \
+    else sed -i '/^\[Daemon\]/a AutomaticUpdatePolicy=stage' /etc/rpm-ostreed.conf; fi; \
+    grep -qx 'AutomaticUpdatePolicy=stage' /etc/rpm-ostreed.conf; \
+    systemctl enable rpm-ostreed-automatic.timer; \
+    # don't announce this PC or answer name lookups on the local network
+    systemctl mask avahi-daemon.socket avahi-daemon.service; \
+    python3 -I /run/build/policy.py; \
+    # sanity checks: programs parse, units are valid, services are switched on
+    python3 -I -c 'import ast,sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' \
+      /usr/libexec/claudeos/claudeos-guard /usr/lib/claudeos/sentinel/claudeos_sentinel.py \
+      /usr/bin/claudeos-sentinel-report; \
+    python3 -I -m json.tool /etc/claude-code/managed-settings.json >/dev/null; \
+    python3 -I -m json.tool /etc/containers/policy.json >/dev/null; \
+    for f in /usr/sbin/claudeos-apply /usr/sbin/claudeos-audit-rotate /usr/sbin/claudeos-snapshot \
+             /usr/libexec/claudeos/flatpak-update; do bash -n "$f"; done; \
+    for f in /usr/libexec/claudeos/nvidia-card /usr/libexec/claudeos/greeter-compositor \
+             /usr/libexec/claudeos/labwc-session; do sh -n "$f"; done; \
+    systemd-analyze verify --man=no /usr/lib/systemd/system/claudeos-*.service /usr/lib/systemd/system/claudeos-*.timer; \
+    for u in multi-user.target.wants/claudeos-sentinel.service timers.target.wants/claudeos-snapshot.timer \
+             timers.target.wants/claudeos-audit-rotate.timer timers.target.wants/claudeos-flatpak-update.timer; do \
+      test -f "/usr/lib/systemd/system/$u"; done; \
+    test "$(readlink /etc/systemd/system/avahi-daemon.service)" = /dev/null
 RUN bootc container lint

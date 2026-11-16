@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# claudeos-audit-rotate — monthly: seal the old audit log, start a new one.
+# Old logs are compressed and made immutable (chattr +i): nobody but root
+# removing that flag first can change or delete them.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin
+DIR=/var/log/claudeos; LOG=$DIR/audit.jsonl
+OWNER_GROUP="$(stat -c %G "$LOG")"
+[ -s "$LOG" ] || exit 0
+OLD="$DIR/audit-$(date +%Y%m%d-%H%M%S).jsonl"
+install -m 0660 -o root -g "$OWNER_GROUP" /dev/null "$LOG.new"
+chattr -a "$LOG"
+mv "$LOG" "$OLD"
+mv "$LOG.new" "$LOG"
+chattr +a "$LOG"
+chmod 0640 "$OLD"
+gzip -9 "$OLD"
+chattr +i "$OLD.gz"
+restorecon -F "$LOG" "$OLD.gz"
+echo "audit log sealed: $OLD.gz"

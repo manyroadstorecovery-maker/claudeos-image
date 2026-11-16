@@ -1,0 +1,50 @@
+# ClaudeOS network sentinel (system service; Claude can't stop or change it)
+[Unit]
+Description=ClaudeOS network sentinel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/lib/claudeos/sentinel/claudeos_sentinel.py
+Restart=always
+RestartSec=5
+SyslogIdentifier=claudeos-sentinel
+
+# Runs as a throwaway account made up at start; keeps its memory in /var/lib/claudeos-sentinel
+DynamicUser=yes
+StateDirectory=claudeos-sentinel
+StateDirectoryMode=0700
+
+# Only three powers: listen to the network, see which program owns a connection, read autostart files
+AmbientCapabilities=CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+
+# Everything else locked: the whole disk is read-only to it
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_PACKET AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# Stays light
+MemoryMax=150M
+CPUQuota=25%
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

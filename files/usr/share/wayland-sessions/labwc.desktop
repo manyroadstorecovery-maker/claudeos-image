@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=labwc
+Comment=ClaudeOS desktop (labwc, a lean Wayland compositor)
+Exec=/usr/libexec/claudeos/labwc-session
+Type=Application
+DesktopNames=labwc;wlroots

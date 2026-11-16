@@ -1,0 +1,10 @@
+[Unit]
+Description=ClaudeOS: update Flatpak apps (security fixes for the browser etc.)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/claudeos/flatpak-update
+Nice=10
+IOSchedulingClass=idle

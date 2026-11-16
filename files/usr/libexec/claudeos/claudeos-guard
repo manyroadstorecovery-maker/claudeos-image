@@ -1,0 +1,353 @@
+#!/usr/bin/python3 -I
+"""claudeos-guard — Claude Code hook: audit every action, block dangerous ones.
+
+Baked into the read-only ClaudeOS image at /usr/libexec/claudeos/claudeos-guard and wired up in
+/etc/claude-code/managed-settings.json, so Claude (running as the normal user)
+can neither edit nor switch it off.
+
+For every hook event it appends one JSON line to the audit log. For PreToolUse
+it also decides whether the tool call may run. If anything goes wrong (log
+missing, disk full, a bug), PreToolUse fails closed: the action is blocked.
+
+This is a seatbelt, not a wall. A determined attacker can hide a command from
+pattern checks; the real walls are: Claude isn't root, polkit asks for the
+admin password, and the base OS is read-only. These checks catch mistakes and
+casual prompt-injection, and the audit log records everything either way.
+"""
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import sys
+
+AUDIT_LOG = "/var/log/claudeos/audit.jsonl"
+MAX_FIELD = 8000          # characters of tool input kept per record
+MAX_RESPONSE = 400        # characters of tool output kept per record
+
+ASK_USER = "This needs the user's admin password. Write the command into a script and ask the user to run: sudo claudeos-apply <label> <script>"
+
+# ---------------------------------------------------------------- paths
+# Things that must never be deleted, overwritten or have attributes changed.
+PROTECTED = re.compile(
+    r"(/var/log\b|/snapshots\b|/var/lib/claudeos\b|/etc/claude-code\b|"
+    r"/usr/local/lib/claudeos\b|/usr/local/sbin/claudeos|/etc/polkit-1\b|/etc/sddm\.conf\.d\b|"
+    r"/etc/systemd/system/claudeos|/etc/containers/policy\.json|/etc/pki/containers\b|"
+    r"\.claude/projects\b)")
+# Secrets Claude has no reason to read (and a hijacked agent would love to).
+SECRETS = re.compile(
+    r"(\.ssh/|\.gnupg/|\.claude/\.credentials\.json|\.local/share/keyrings|"
+    r"logins\.json|key4\.db|cookies\.sqlite|/etc/shadow|/etc/gshadow)")
+
+# ---------------------------------------------------------------- shell parsing
+SPLIT = re.compile(r"\|\||&&|[;|&\n]|\$\(|`|\(|\)|\{|\}")
+WRAPPERS = {"env", "nice", "nohup", "time", "command", "exec", "builtin",
+            "stdbuf", "ionice", "timeout", "xargs", "unbuffer", "setsid", "chrt",
+            "flock", "watch"}
+SHELLS = {"bash", "sh", "zsh", "dash", "fish", "ksh"}
+
+
+def words(segment):
+    try:
+        return shlex.split(segment, comments=True)
+    except ValueError:
+        return segment.split()
+
+
+def strip_wrappers(argv):
+    """Drop VAR=value prefixes and wrappers like `env`, `nice -n 5`, `timeout 10`."""
+    i = 0
+    while i < len(argv):
+        w = argv[i]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w):
+            i += 1
+        elif os.path.basename(w) in WRAPPERS:
+            i += 1
+            while i < len(argv) and (argv[i].startswith("-") or argv[i].isdigit()
+                                     or re.fullmatch(r"\d+[smhd]?", argv[i])):
+                i += 1
+        else:
+            break
+    return argv[i:]
+
+
+def nonopts(args):
+    return [a for a in args if not a.startswith("-")]
+
+
+def abbr(word, full):
+    """nmcli-style abbreviations: 'con' matches 'connection'."""
+    return bool(word) and full.startswith(word)
+
+
+# ---------------------------------------------------------------- per-command rules
+def rule(argv):
+    """Return a block reason for one simple command, or None."""
+    if not argv:
+        return None
+    cmd = os.path.basename(argv[0])
+    args = argv[1:]
+    pos = nonopts(args)
+    sub = pos[0] if pos else ""
+
+    if cmd in SHELLS and "-c" in args:
+        i = args.index("-c")
+        if i + 1 < len(args):
+            return check_shell(args[i + 1])
+    if cmd == "eval":
+        return check_shell(" ".join(args))
+
+    if cmd in {"sudo", "su", "pkexec", "doas", "run0", "machinectl"}:
+        return f"`{cmd}` gives admin rights. " + ASK_USER
+
+    if cmd in {"setenforce", "setsebool", "semanage", "semodule", "load_policy",
+               "auditctl", "augenrules", "chattr", "passwd", "chsh", "chfn",
+               "usermod", "useradd", "userdel", "groupadd", "gpasswd", "chage",
+               "mokutil", "efibootmgr", "bootctl", "cryptsetup", "systemd-cryptenroll",
+               "firewall-offline-cmd", "firewall-config", "iptables-restore",
+               "ip6tables-restore", "nft-restore", "sysctl", "grubby",
+               "shutdown", "reboot", "poweroff", "halt", "service", "chkconfig",
+               "logrotate"} or cmd.startswith("grub2-") or cmd.startswith("tpm2_"):
+        return f"`{cmd}` changes security, boot, accounts or power. " + ASK_USER
+
+    if cmd == "firewall-cmd":
+        readonly = re.compile(r"--(state|(list|get|query|info)-[\w-]+(=.*)?|"
+                              r"zone(=.*)?|policy(=.*)?|permanent|help|version)$")
+        bad = [a for a in args if a.startswith("--") and not readonly.match(a)]
+        if bad:
+            return f"Firewall changes ({bad[0]}) are reserved for the user. " + ASK_USER
+
+    if cmd == "nft":
+        if set(args) & {"add", "delete", "flush", "insert", "replace", "create",
+                        "destroy", "reset", "-f", "--file"}:
+            return "Changing nftables rules is reserved for the user. " + ASK_USER
+    if cmd in {"iptables", "ip6tables", "ebtables", "arptables"}:
+        if any(re.fullmatch(r"-[ADIRFXPNZE]|--(append|delete|insert|replace|flush|"
+                            r"delete-chain|policy|new-chain|zero|rename-chain)", a) for a in args):
+            return "Changing firewall tables is reserved for the user. " + ASK_USER
+
+    if cmd == "systemctl" and "--user" not in args:
+        mutating = {"start", "stop", "restart", "try-restart", "reload", "reload-or-restart",
+                    "try-reload-or-restart", "enable", "disable", "reenable", "mask",
+                    "unmask", "kill", "isolate", "edit", "revert", "set-property",
+                    "set-environment", "unset-environment", "import-environment",
+                    "daemon-reload", "daemon-reexec", "preset", "preset-all", "link",
+                    "add-wants", "add-requires", "freeze", "thaw", "clean", "poweroff",
+                    "reboot", "halt", "kexec", "rescue", "emergency", "default",
+                    "switch-root", "soft-reboot", "suspend", "hibernate", "hybrid-sleep",
+                    "suspend-then-hibernate", "set-default"}
+        if sub in mutating:
+            return f"`systemctl {sub}` on system services is reserved for the user. " + ASK_USER
+    if cmd == "systemd-run" and "--user" not in args:
+        return "Running system-level units is reserved for the user. " + ASK_USER
+    if cmd == "loginctl" and sub in {"poweroff", "reboot", "terminate-session",
+                                     "terminate-user", "kill-session", "kill-user",
+                                     "disable-linger"}:
+        return "Ending sessions or powering off needs the user's say-so; ask them."
+
+    if cmd == "rpm-ostree":
+        if not (sub in {"", "status", "db", "compose"}
+                or (sub in {"upgrade", "update"} and ({"--check", "--preview"} & set(args)))
+                or (sub == "kargs" and len(pos) == 1 and len(args) == 1)
+                or "--version" in args or "--help" in args):
+            return f"`rpm-ostree {sub}` changes the base OS. " + ASK_USER
+    if cmd == "bootc" and not (sub in {"", "status"} or
+                               (sub == "upgrade" and "--check" in args)):
+        return f"`bootc {sub}` changes the base OS. " + ASK_USER
+    if cmd == "ostree":
+        ok = {"log", "show", "ls", "cat", "rev-parse", "diff", "refs", "summary"}
+        if not (sub in ok or (sub == "admin" and len(pos) > 1 and pos[1] in {"status", "config-diff"})
+                or (sub == "remote" and len(pos) > 1 and pos[1] in {"list", "show-url", "summary", "refs"})
+                or "--version" in args or "--help" in args):
+            return f"`ostree {' '.join(pos[:2])}` can change the base OS. " + ASK_USER
+
+    if cmd == "flatpak":
+        if sub in {"remote-add", "remote-modify", "remote-delete", "install-bundle",
+                   "build-bundle", "build-import-bundle", "build-sign", "build-update-repo"}:
+            return f"`flatpak {sub}` changes where apps come from. " + ASK_USER
+        if sub == "override" and "--show" not in args:
+            return "`flatpak override` loosens app sandboxes. " + ASK_USER
+        if sub == "config" and not ({"--list", "--get"} & set(args)) and len(pos) > 1:
+            return "`flatpak config` changes are reserved for the user. " + ASK_USER
+        if "--no-gpg-verify" in args or "--from" in args or "--bundle" in args or \
+                any(a.endswith((".flatpakref", ".flatpak", ".flatpakrepo")) or "://" in a for a in pos[1:]):
+            return "Flatpak installs must come from the verified Flathub/Fedora remotes."
+
+    if cmd == "nmcli":
+        obj = sub
+        act = pos[1] if len(pos) > 1 else ""
+        if abbr(obj, "connection") and any(abbr(act, x) for x in
+                ("modify", "add", "delete", "edit", "import", "load", "reload", "up", "down", "clone")):
+            return "Changing network connections is reserved for the user. " + ASK_USER
+        if (abbr(obj, "networking") or abbr(obj, "radio")) and {"on", "off"} & set(pos):
+            return "Turning networking on/off is reserved for the user."
+        if abbr(obj, "general") and (abbr(act, "hostname") and len(pos) > 2 or abbr(act, "logging") and len(pos) > 2):
+            return "Changing hostname/logging is reserved for the user. " + ASK_USER
+        if abbr(obj, "device") and any(abbr(act, x) for x in
+                ("disconnect", "delete", "set", "modify", "connect", "reapply", "up", "down")):
+            return "Changing network devices is reserved for the user. " + ASK_USER
+    if cmd == "resolvectl":
+        if sub == "revert" or (sub in {"dns", "domain", "default-route", "llmnr", "mdns",
+                                       "dnssec", "dnsovertls", "nta"} and len(pos) > 2):
+            return "Changing DNS settings is reserved for the user. " + ASK_USER
+    if cmd == "networkctl" and sub in {"reload", "reconfigure", "renew", "forcerenew",
+                                       "down", "up", "delete", "edit"}:
+        return "Changing network links is reserved for the user. " + ASK_USER
+    if cmd in {"hostnamectl", "timedatectl", "localectl"} and (
+            sub.startswith("set-") or (sub in {"hostname", "icon-name", "chassis",
+                                              "deployment", "location"} and len(pos) > 1)):
+        return f"`{cmd} {sub}` changes system settings. " + ASK_USER
+    if cmd == "fwupdmgr" and not (sub in {"", "get-devices", "get-updates", "get-upgrades",
+                                          "get-history", "get-remotes", "get-releases",
+                                          "get-details", "refresh", "security", "hwids",
+                                          "get-approved-firmware", "get-blocked-firmware",
+                                          "get-bios-setting", "get-plugins", "get-topology",
+                                          "--version", "--help"}):
+        return f"`fwupdmgr {sub}` touches firmware. " + ASK_USER
+
+    if cmd in {"busctl", "gdbus", "dbus-send", "qdbus"} and \
+            not ({"--user", "--session"} & set(args)) and \
+            ({"call", "set-property", "emit"} & set(args) or cmd == "dbus-send"):
+        return "Direct calls on the system message bus can bypass the checks above. " + ASK_USER
+
+    if cmd == "journalctl" and any(a.startswith(("--vacuum", "--rotate", "--flush",
+                                                 "--relinquish", "--setup-keys")) for a in args):
+        return "Journal maintenance would delete or move logs; that's reserved for the user."
+
+    if cmd == "btrfs" and ((len(pos) > 1 and abbr(pos[0], "subvolume") and abbr(pos[1], "delete"))
+                           or (len(pos) > 1 and abbr(pos[0], "property") and abbr(pos[1], "set"))):
+        return "Deleting btrfs subvolumes/snapshots is reserved for the user. " + ASK_USER
+
+    if cmd in {"kill", "pkill", "killall"} and re.search(
+            r"firewalld|claudeos|journald|auditd|polkit|sentinel", " ".join(args)):
+        return "Stopping security services is never allowed for Claude."
+
+    if cmd == "claude" and ({"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"} & set(args)
+                            or "bypassPermissions" in args):
+        return "Starting Claude without permission checks is not allowed."
+
+    destructive = {"rm", "rmdir", "shred", "truncate", "mv", "unlink", "dd", "chmod",
+                   "chown", "chgrp", "setfacl", "cp", "install", "ln", "tee", "sed",
+                   "perl", "rsync", "touch", "mkfs", "wipefs"}
+    if cmd in destructive and any(PROTECTED.search(a) for a in args) and not \
+            (cmd == "cp" and not PROTECTED.search(args[-1] if args else "")) and not \
+            (cmd == "rsync" and not PROTECTED.search(args[-1] if args else "")) and not \
+            (cmd == "sed" and not any(a.startswith("-i") or a == "--in-place" for a in args)):
+        return "That would change audit logs, snapshots or guardrail files, which is never allowed."
+    if cmd == "find" and any(PROTECTED.search(a) for a in args) and \
+            ({"-delete", "-exec", "-execdir", "-ok", "-okdir"} & set(args)):
+        return "That would change audit logs, snapshots or guardrail files, which is never allowed."
+    return None
+
+
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+SHELL_FEED = re.compile(r"(^|[\s;&|(])(env\s+)?(/\S*/)?(ba|z|da|k|fi)?sh(\s+-\S+)*\s*<<")
+
+
+def split_heredocs(command):
+    """Separate here-document bodies (data) from the command lines around them.
+    Bodies fed into a shell (`bash <<EOF`) are returned as code to check."""
+    code, data, lines, i = [], [], command.split("\n"), 0
+    while i < len(lines):
+        line = lines[i]
+        code.append(line)
+        m = HEREDOC.search(line)
+        i += 1
+        if m:
+            end, body = m.group(2), []
+            while i < len(lines) and lines[i].strip() != end:
+                body.append(lines[i])
+                i += 1
+            i += 1  # skip the terminator
+            (code if SHELL_FEED.search(line) else data).append("\n".join(body))
+    return "\n".join(code), "\n".join(data)
+
+
+def check_shell(command):
+    """Check a whole shell command line. Return a block reason or None."""
+    if SECRETS.search(command):
+        return "That touches private keys, passwords or login tokens. Ask the user to do it."
+    command, _data = split_heredocs(command)
+    if re.search(r">>?\|?\s*['\"]?[^\s;&|]*" + PROTECTED.pattern, command):
+        return "Writing into audit logs, snapshots or guardrail files is never allowed."
+    for segment in SPLIT.split(command):
+        argv = strip_wrappers(words(segment.strip()))
+        reason = rule(argv)
+        if reason:
+            return reason
+    return None
+
+
+def check_tool(tool, tool_input):
+    if not isinstance(tool_input, dict):
+        return None
+    cmd = tool_input.get("command")
+    if isinstance(cmd, str):
+        reason = check_shell(cmd)
+        if reason:
+            return reason
+    for key in ("file_path", "path", "notebook_path"):
+        val = tool_input.get(key)
+        if isinstance(val, str):
+            full = os.path.expanduser(val)
+            if SECRETS.search(full):
+                return "That file holds private keys, passwords or login tokens. Ask the user."
+            if tool in {"Write", "Edit", "NotebookEdit", "MultiEdit"} and PROTECTED.search(full):
+                return "Audit logs, snapshots and guardrail files can't be edited by Claude."
+    return None
+
+
+# ---------------------------------------------------------------- audit log
+def clip(value, limit):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= limit else text[:limit] + f"…[+{len(text) - limit} chars]"
+
+
+def record(data, path=AUDIT_LOG, **extra):
+    entry = {
+        "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "event": data.get("hook_event_name", "?"),
+        "session": data.get("session_id", ""),
+        "mode": data.get("permission_mode", ""),
+        "cwd": data.get("cwd", ""),
+    }
+    if "tool_name" in data:
+        entry["tool"] = data["tool_name"]
+        entry["tool_use_id"] = data.get("tool_use_id", "")
+    entry.update(extra)
+    line = (json.dumps(entry, ensure_ascii=False) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)   # no O_CREAT: missing log = fail closed
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def main():
+    data = json.load(sys.stdin)
+    event = data.get("hook_event_name")
+    if event == "PreToolUse":
+        tool, tool_input = data.get("tool_name", ""), data.get("tool_input", {})
+        reason = check_tool(tool, tool_input)
+        record(data, input=clip(tool_input, MAX_FIELD),
+               decision="deny" if reason else "pass", reason=reason or "")
+        if reason:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "ClaudeOS guardrail: " + reason}}))
+    elif event == "PostToolUse":
+        record(data, response=clip(data.get("tool_response", ""), MAX_RESPONSE))
+    elif event == "UserPromptSubmit":
+        record(data, prompt=clip(data.get("prompt", ""), MAX_FIELD))
+    else:
+        record(data, detail=clip({k: v for k, v in data.items()
+                                  if k in ("source", "reason", "model", "agent_type")}, 500))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:  # fail closed
+        print(f"ClaudeOS guard error, action blocked: {exc!r}", file=sys.stderr)
+        sys.exit(2)

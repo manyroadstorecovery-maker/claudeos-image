@@ -1,0 +1,5 @@
+#!/usr/bin/sh
+# Login-screen compositor wrapper (ClaudeOS): use only the GT 1030 when its driver is loaded.
+card=$(/usr/libexec/claudeos/nvidia-card)
+[ -n "$card" ] && export WLR_DRM_DEVICES="$card"
+exec /usr/libexec/sddm-compositor-sway "$@"

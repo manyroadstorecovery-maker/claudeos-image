@@ -1,0 +1,7 @@
+#!/usr/bin/sh
+# Prints the GT 1030's DRM card path, waiting up to 15 s for its driver. Prints nothing if absent
+# (other PCs, or the NVIDIA driver failed): callers then use every graphics card as normal.
+NV=/dev/dri/by-path/pci-0000:01:00.0-card
+i=0
+while [ ! -e "$NV" ] && [ "$i" -lt 30 ]; do sleep 0.5; i=$((i+1)); done
+[ -e "$NV" ] && readlink -f "$NV"

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# claudeos-apply — the one way to make a system change on ClaudeOS.
+#   sudo claudeos-apply <label> <script.sh>
+# 1. copies the script somewhere Claude can't touch, so what you approve is what runs
+# 2. shows it to you and waits for "yes"
+# 3. takes a rollback snapshot (your files + the system)
+# 4. runs it, and writes the start and result to the audit log
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin
+
+LOG=/var/log/claudeos/audit.jsonl
+[ "$(id -u)" -eq 0 ] || { echo "Run with sudo: sudo claudeos-apply <label> <script>"; exit 1; }
+[ $# -eq 2 ] || { echo "Usage: sudo claudeos-apply <label> <script.sh>"; exit 1; }
+LABEL="$1"; SRC="$2"
+[[ "$LABEL" =~ ^[A-Za-z0-9_.-]{1,40}$ ]] || { echo "Label: letters, digits, _ . - only (max 40)"; exit 1; }
+[ -f "$SRC" ] || { echo "No such file: $SRC"; exit 1; }
+
+WORK="$(mktemp -d /run/claudeos-apply.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+cp -- "$SRC" "$WORK/script.sh"
+chmod 0500 "$WORK/script.sh"
+SHA="$(sha256sum "$WORK/script.sh" | cut -d' ' -f1)"
+
+log() {  # log <phase> [exit_code]
+  python3 -I -c 'import json,sys,datetime as d
+e={"ts":d.datetime.now().astimezone().isoformat(timespec="seconds"),"event":"SystemChange",
+   "phase":sys.argv[1],"label":sys.argv[2],"script":sys.argv[3],"sha256":sys.argv[4],
+   "by":sys.argv[5],"exit":sys.argv[6]}
+open(sys.argv[7],"a").write(json.dumps(e)+"\n")' "$1" "$LABEL" "$(realpath -- "$SRC")" "$SHA" "${SUDO_USER:-root}" "${2:-}" "$LOG"
+}
+
+echo "──────── $(realpath -- "$SRC")   sha256 ${SHA:0:16}…"
+cat -n "$WORK/script.sh"
+echo "────────"
+read -r -p "Run this as root? A snapshot is taken first. Type yes: " answer
+[ "$answer" = "yes" ] || { echo "Cancelled; nothing changed."; exit 1; }
+
+claudeos-snapshot pre "$LABEL"
+log start
+set +e
+bash "$WORK/script.sh"
+rc=$?
+set -e
+log end "$rc"
+if [ "$rc" -eq 0 ]; then
+  echo "✔ Done ($LABEL). Undo point: snapshots *-pre-*-$LABEL"
+else
+  echo "✘ The script failed (exit $rc). Nothing else was changed; the snapshot is there if needed."
+fi
+exit "$rc"
